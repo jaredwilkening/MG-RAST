@@ -3,6 +3,7 @@ package JobDB::Project;
 use strict;
 use warnings;
 use Data::Dumper;
+use MGRAST::Metadata;
 
 use Conf;
 
@@ -97,10 +98,10 @@ sub count_public {
 }
 
 sub get_private_projects {
-  my ($self, $user) = @_;
+  my ($self, $user, $edit) = @_;
 
   unless ($user && ref($user)) { return []; }
-  my $ids = $user->has_right_to(undef, 'view', 'project');
+  my $ids = $edit ? $user->has_right_to(undef,'edit','project') : $user->has_right_to(undef,'view','project');
   unless ($ids && (@$ids > 0)) { return []; }
 
   my $private = [];
@@ -397,6 +398,7 @@ sub enviroments {
 sub sequence_types {
   my ($self) = @_;
   ## calculated takes precidence over inputed
+  my $mddb    = MGRAST::Metadata->new();
   my $query   = "select distinct j.sequence_type from Job j, ProjectJob p where p.project=".$self->_id." and p.job=j._id";
   my $results = $self->_master->db_handle->selectcol_arrayref($query);
   unless ($results && @$results) {
@@ -405,7 +407,7 @@ sub sequence_types {
     my $tmp  = $self->_master->db_handle->selectcol_arrayref($query);
     unless ($tmp && @$tmp) { return []; }
     foreach my $s (@$tmp) {
-      push @$results, ($s =~ /metagenome/i) ? 'WGS' : (($s =~ /mimarks/i) ? 'Amplicon' : '');
+      push @$results, $mddb->investigation_type_alias($s);
     }
   }
   @$results = grep { $_ } @$results;

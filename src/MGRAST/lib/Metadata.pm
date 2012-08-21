@@ -20,7 +20,7 @@ sub new {
   $debug = $debug || '';
   my $self = { app   => $app,
 	       debug => $debug,
-	       ontology_url => 'http://bioportal.bioontology.org/ontologies/',
+	       ontology_url => 'http://bioportal.bioontology.org/visualize/',
 	       ontology_api => 'http://rest.bioontology.org/bioportal/search',
 	       ontology_key => '56a9721b-0d62-4185-933d-81447db2457a'
 	     };
@@ -230,7 +230,7 @@ sub get_jobs_metadata_fast {
   my $dbh   = $self->{_handle}->db_handle;
   my $key   = $is_mgid ? 'metagenome_id' : 'job_id';
   my $where = $is_mgid ? 'metagenome_id IN ('.join(',', map {"'$_'"} @$job_ids).')' : 'job_id IN ('.join(',', @$job_ids).')';
-  my $jobs = $dbh->selectall_arrayref("SELECT ".$key.", primary_project, sample, library, sequence_type, name FROM Job WHERE ".$where);
+  my $jobs = $dbh->selectall_arrayref("SELECT ".$key.",primary_project,sample,library,sequence_type,name,metagenome_id,file,file_checksum_raw FROM Job WHERE ".$where);
   my $meth = $dbh->selectall_arrayref("SELECT j.".$key.", a.value FROM Job j, JobAttributes a WHERE j._id=a.job AND a.tag='sequencing_method_guess'");
   my %pids = map { $_->[1], 1 } grep {$_->[1] && ($_->[1] =~ /\d+/)} @$jobs;
   my %sids = map { $_->[2], 1 } grep {$_->[2] && ($_->[2] =~ /\d+/)} @$jobs;
@@ -272,8 +272,9 @@ sub get_jobs_metadata_fast {
   }
 
   foreach my $row (@$jobs) {
-    my ($j, $p, $s, $l, $t, $n) = @$row;
-    $n = $n || '';
+    # $key,primary_project,sample,library,sequence_type,name,metagenome_id,file,file_checksum_raw
+    my ($j, $p, $s, $l, $t, $n, $m, $f, $c) = @$row;
+    $n = $n || '';    
     if ($p && exists($projs->{$p})) {
       map { $projs->{$p}{data}{$_} =~ s/^(gaz|country):\s?//i } grep {$projs->{$p}{data}{$_}} keys %{$projs->{$p}{data}};
       $data->{$j}{project} = $projs->{$p};
@@ -290,16 +291,16 @@ sub get_jobs_metadata_fast {
       unless ($data->{$j}{library}{name}) {
 	$data->{$j}{library}{name} = $n;
       }
-      ## type: calculated takes precidence over inputed
-      if ($t) {
-	$data->{$j}{library}{type} = $t;
-      } else {
-	$data->{$j}{library}{type} = $libs->{$l}{data}{investigation_type} || '';
-	$data->{$j}{library}{type} = ($data->{$j}{library}{type} =~ /metagenome/i) ? 'WGS' : (($data->{$j}{library}{type} =~ /mimarks/i) ? 'Amplicon' : '');
+      ## type: calculated takes precidence over inputed      
+      $data->{$j}{library}{type} = $t ? $t : $self->investigation_type_alias($libs->{$l}{data}{investigation_type});
+      unless ($data->{$j}{library}{data}{seq_meth}) {
+	$data->{$j}{data}{library}{seq_meth} = exists($mmap{$j}) ? $mmap{$j} : '';
       }
-      unless ($data->{$j}{data}{seq_meth}) {
-	$data->{$j}{data}{seq_meth} = exists($mmap{$j}) ? $mmap{$j} : '';
-      }
+      # make sure these are same as job table
+      $data->{$j}{library}{data}{metagenome_id}   = $m;
+      $data->{$j}{library}{data}{metagenome_name} = $n;
+      if ($f) { $data->{$j}{library}{data}{file_name} = $f; }
+      if ($c) { $data->{$j}{library}{data}{file_checksum} = $c; }
     }
     if ($s && exists($epks->{$s})) {
       $data->{$j}{env_package} = $epks->{$s};
@@ -345,15 +346,16 @@ sub get_jobs_metadata {
     if ($job->library) {
       $data->{$key}{library} = {id => 'mgl'.$job->library->ID, name => $job->library->name || $job->name, data => $job->library->data};
       ## type: calculated takes precidence over inputed
-      if ($job->sequence_type) {
-	$data->{$key}{library}{type} = $job->sequence_type;
-      } else {
-	$data->{$key}{library}{type} = $job->library->lib_type || '';
-	$data->{$key}{library}{type} = ($data->{$key}{library}{type} =~ /metagenome/i) ? 'WGS' : (($data->{$key}{library}{type} =~ /mimarks/i) ? 'Amplicon' : '');
-      }
+      $data->{$key}{library}{type} = $job->sequence_type ? $job->sequence_type : $self->investigation_type_alias($job->library->lib_type);
       unless ($data->{$key}{library}{data}{seq_meth}) {
 	$data->{$key}{library}{data}{seq_meth} = $job->data('sequencing_method_guess')->{sequencing_method_guess} || '';
       }
+      # make sure these are same as job table
+      $data->{$key}{library}{data}{metagenome_id}   = $job->{metagenome_id};
+      $data->{$key}{library}{data}{metagenome_name} = $job->{name} ? $job->{name} : '';
+      if ($job->{file}) { $data->{$key}{library}{data}{file_name} = $job->{file}; }
+      if ($job->{file_checksum_raw}) { $data->{$key}{library}{data}{file_checksum} = $job->{file_checksum_raw}; }
+      # add template if requested
       if ($full_data) {
 	$data->{$key}{library}{data} = $self->add_template_to_data($job->library->lib_type, $data->{$key}{library}{data});
       }
@@ -610,9 +612,9 @@ sub export_metadata_for_project {
       my $lib_jobs = $lib->jobs;
       if (@$lib_jobs > 0) {
 	$ldata->{metagenome_id} = $lib_jobs->[0]->{metagenome_id};
-	unless (exists $ldata->{metagenome_name}) {
-	   $ldata->{metagenome_name} = $lib_jobs->[0]->{name};
-	}
+	$ldata->{metagenome_name} = $lib_jobs->[0]->{name} || '';
+	if ($lib_jobs->[0]->{file}) { $ldata->{file_name} = $lib_jobs->[0]->{file}; }
+	if ($lib_jobs->[0]->{file_checksum_raw}) { $ldata->{file_checksum} = $lib_jobs->[0]->{file_checksum_raw}; }
       }
       push @{ $s_obj->{libraries} }, { name => $lib->name || 'mgl'.$lib->ID,
 				       id   => 'mgl'.$lib->ID,
@@ -865,7 +867,7 @@ sub update_curator {
 }
 
 sub validate_metadata {
-  my ($self, $filename, $skip_required) = @_;
+  my ($self, $filename, $skip_required, $map_by_id) = @_;
 
   my $extn = '';
   if ($filename =~ /\.(xls(x)?)$/) {
@@ -878,7 +880,7 @@ sub validate_metadata {
 
   my $data = {};
   my $json = new JSON;
-  my $cmd  = $Conf::validate_metadata.($skip_required ? " -s" : "")." -f $extn -j $out_name $filename 2>&1";
+  my $cmd  = $Conf::validate_metadata.($skip_required ? " -s" : "").($map_by_id ? " -d" : "")." -f $extn -j $out_name $filename 2>&1";
   my $log  = `$cmd`;
   chomp $log;
   
@@ -902,28 +904,39 @@ sub add_valid_metadata {
   my ($self, $user, $data, $jobs, $project, $map_by_id, $delete_old) = @_;
 
   unless ($user && ref($user)) {
-    print STDERR "invalid user object";
-    return [];
+    return ([], ["invalid user object"]);
   }
 
+  my $err_msg = [];
   my $added   = [];
   my $mddb    = $self->{_handle};
   my $curator = $self->add_curator($user);
   my $job_map = {};
+  my $job_name_change = []; # [old, new]
   if ($map_by_id) {
-    %$job_map = map { $_->metagenome_id, $_ } grep { $user->has_right(undef, 'edit', 'metagenome', $_->metagenome_id) } @$jobs;
+    %$job_map = map {$_->metagenome_id, $_} grep {$user->has_right(undef, 'edit', 'metagenome', $_->metagenome_id) || $user->has_star_right('edit', 'metagenome')} @$jobs;
   } else {
-    %$job_map = map { $_->name, $_ } grep { $user->has_right(undef, 'edit', 'metagenome', $_->metagenome_id) } @$jobs;
+    %$job_map = map {$_->name, $_} grep {$user->has_right(undef, 'edit', 'metagenome', $_->metagenome_id) || $user->has_star_right('edit', 'metagenome')} @$jobs;
+  }
+  if (scalar(keys %$job_map) < scalar(@$jobs)) {
+    push @$err_msg, "user lacks permission to edit ".(scalar(@$jobs) - scalar(keys %$job_map))." metagenome(s)";
   }
   
   ### create project / add jobs and metadata
+  my $new_proj = 0;
+  my @proj_md  = map { [$_, $data->{data}{$_}{value}] } keys %{$data->{data}};
   unless ($project && ref($project)) {
-    my @pmd  = map { [$_, $data->{data}{$_}{value}] } keys %{$data->{data}};
-    $project = $mddb->Project->create_project($user, $data->{name}, \@pmd, $curator, 0);
+    $project  = $mddb->Project->create_project($user, $data->{name}, \@proj_md, $curator, 0);
+    $new_proj = 1;
   }
-  unless ( $user->has_right(undef, 'edit', 'project', $project->id) ) {
-    print STDERR "user lacks permission to edit project ".$project->id;
-    return [];
+  unless ( $user->has_right(undef, 'edit', 'project', $project->id) || $user->has_star_right('edit', 'project') ) {
+    push @$err_msg, "user lacks permission to edit project ".$project->id;
+    return ([], $err_msg);
+  }
+  unless ($new_proj) {
+    foreach my $md (@proj_md) {
+      $project->data($md->[0], $md->[1]);
+    }
   }
 
   ## process samples
@@ -939,6 +952,7 @@ sub add_valid_metadata {
 	$samp_proj = $mddb->ProjectCollection->get_objects({project => $project, collection => $samp_coll});
       }
       if (@$samp_proj == 0) {
+	push @$err_msg, "sample ".$samp->{id}." does not exist";
 	next SAMP;
       } else {
 	# valid sample for this project
@@ -991,6 +1005,7 @@ sub add_valid_metadata {
       my $lib_mg  = $map_by_id ? ($lib->{data}{metagenome_id} ? $lib->{data}{metagenome_id}{value} : undef) : $lib->{data}{metagenome_name}{value};
       my $lib_job = ($lib_mg && exists($job_map->{$lib_mg})) ? $job_map->{$lib_mg} : undef;
       unless ($lib_job && ref($lib_job)) {
+	push @$err_msg, "unable to map a metagenome to library ".$lib->{name};
 	next LIB;
       }
 
@@ -1005,6 +1020,7 @@ sub add_valid_metadata {
 	  $lib_proj = $mddb->ProjectCollection->get_objects({project => $project, collection => $lib_coll});
 	}
 	if (@$lib_proj == 0) {
+	  push @$err_msg, "library ".$lib->{id}." does not exist";
 	  next LIB;
 	} else {
 	  # valid library for this project
@@ -1027,7 +1043,7 @@ sub add_valid_metadata {
       ### add job to project
       my $msg = $project->add_job($lib_job);
       if ($msg =~ /error/i) {
-	print STDERR $msg;
+	push @$err_msg, $msg;
 	next LIB;
       } else {
 	## delete old if exists and not same as new
@@ -1055,14 +1071,32 @@ sub add_valid_metadata {
 	$project->add_collection( $lib_job->library );
 	push @$added, $lib_job;
 	$has_lib = 1;
+
+	# change job name if differs and using id mapping
+	if ($map_by_id && exists($lib->{data}{metagenome_name}) && ($lib->{data}{metagenome_name}{value} ne $lib_job->name)) {
+	  $lib_job->name( $lib->{data}{metagenome_name}{value} );
+	}
       }
     }
     unless ($has_lib) {
+      push @$err_msg, "sample '".$samp_coll->name."' has no library, not creating sample";
       $samp_coll->delete_all;
       $samp_coll->delete;
     }
   }
-  return $added;
+  return ($added, $err_msg);
+}
+
+sub investigation_type_alias {
+  my ($type) = @_;
+  unless ($type) { return ""; }
+  if    ($type eq 'metagenome')        { return "WGS"; }
+  elsif ($type eq 'mimarks-survey')    { return "Amplicon"; }
+  elsif ($type eq 'metatranscriptome') { return "MT"; }
+  elsif ($type eq 'WGS')               { return "metagenome"; }
+  elsif ($type eq 'Amplicon')          { return "mimarks-survey"; }
+  elsif ($type eq 'MT')                { return "metatranscriptome"; }
+  else { return ""; }
 }
 
 sub html_dump {
